@@ -1,0 +1,1556 @@
+---
+title: "Main analysis"
+output: html_document
+date: '2023-11-20'
+---
+
+
+# Setup
+
+```{r setup, echo = FALSE}
+# Tidy
+ # rm(list=ls())
+ # graphics.off()
+# Preparing workspace
+knitr::opts_chunk$set(echo = TRUE, include = TRUE)
+# Loading packages
+pacman::p_load(knitr, # knit markdown
+               readxl, 
+               readr, 
+               metafor, 
+               dplyr, 
+               tidyverse, 
+               patchwork, # layout of plots
+               cowplot, 
+               ggpubr,
+               gridExtra,
+               #orchaRd, # forest-like plot
+               gridGraphics, # Redraw Base Graphics Using 'grid' Graphics. `gridGraphics` is required to handle base-R plots.
+               here,
+               lme4,
+               car, # logit transformation, car::logit()
+               #boot, # Bootstrap Resampling
+               ggthemes,
+               wesanderson,
+               raincloudplots,
+               RColorBrewer,
+               vcd,
+               statpsych
+               )
+
+source(here("function","function.R"))
+
+```
+
+# Dataset
+
+Import the data (the .csv file named 'all effect size data edited 24-08').
+
+```{r}
+dat_all <- read.csv(here("data","all effect size data edited 24-08.csv")) # http://jenrichmond.rbind.io/post/how-to-use-the-here-package/
+# check data
+head(dat_all)
+
+# remove NAs
+dat_all <- dat_all[!is.na(dat_all$eff.size) & !is.na(dat_all$var.eff.size), ]
+# remove negative and zero variance (sampling variance should be positive when fitting models)
+dat_all <- dat_all[dat_all$var.eff.size != 0, ]
+
+# explore the meta-analytic dataset 
+# the easies way is to use a funnel plot to identify potential outlier (which are sometimes caused by data extraction errors, or typos in the data source) # a funnel plot use the inverse of the standard error (i.e. precision) as y-axis and effect size as x-axis.
+funnel(dat_all$eff.size, sqrt(dat_all$var.eff.size), yaxis="sei", #seinv
+       #xlim = c(-3, 3),
+       ylab = "Standard error",
+       xlab = "Effect size") 
+
+# the funnel plot clearly showed that there were unusual effect sizes (e.g., extremely large or small values)
+# this might be caused by studies using uncommon effect size measures - let's check it
+
+
+# check how many effect size measures in this dataset
+count(dat_all, eff.size.measure) # 11 measures
+
+# define effect size categories
+# this dataset has 11 types of effect size measures, based on which we grouped into 4 broad categories: 
+# (1) standadised mean differences (SMD), including cohens.d,  hedges.d, hedges.g, abs.hedges.d, SMD;
+# (2) log respond ratio (lnRR);
+# (3) correlation (Zr/r);
+# (4) binary, including log odds ratio, relative incident rate ratio (IRR)
+# (5) uncommon effect sizes, including mean difference, regression slope
+grouped_es <- NA
+# (1) SMD: cohens.d,  hedges.d, hedges.g, abs.hedges.d, SMD
+grouped_es[dat_all$eff.size.measure == "cohens.d"|
+           dat_all$eff.size.measure == "hedges.d"|
+           dat_all$eff.size.measure == "hedges.g"|
+           dat_all$eff.size.measure == "abs.hedges.d"|
+           dat_all$eff.size.measure == "SMD"] <- c("SMD") 
+# (2) lnRR: log.ratio
+grouped_es[dat_all$eff.size.measure == "log.ratio"] <- c("lnRR") 
+# (3) Zr: z.r
+grouped_es[dat_all$eff.size.measure == "z.r"] <- c("Zr") 
+# (4) binary: IRR, log.odds.ratio
+grouped_es[dat_all$eff.size.measure == "IRR" | 
+           dat_all$eff.size.measure == "log.odds.ratio"] <- c("binary") 
+# (5) uncommon: mean.diff, reg.slope
+grouped_es[dat_all$eff.size.measure == "mean.diff" |
+           dat_all$eff.size.measure == "reg.slope"] <- c("uncommon") 
+
+# add grouped_es
+dat_all$grouped_es <- as.factor(grouped_es)
+
+# plot effect size excluding uncommon measures
+funnel(dat_all[dat_all$grouped_es != "uncommon",]$eff.size, sqrt(dat_all[dat_all$grouped_es != "uncommon",]$var.eff.size), yaxis="sei", #seinv
+       #xlim = c(-3, 3),
+       ylab = "Standard error",
+       xlab = "Effect size") 
+
+
+```
+
+
+
+# Model fitting
+
+Fit an intercept-only meta-analytic model to each meta-analysis case.
+
+```{r}
+# add observational level id
+dat_all$obs <- 1:nrow(dat_all)
+
+# split the dataset into separate dataset according to the identity of meta-analysis
+ma.id <- dat_all$meta.analysis.id %>% unique()
+dat_list <- NA
+for (i in 1:length(ma.id)) {
+  dat_list[i] <- dat_all[dat_all$meta.analysis.id == i, ] %>% list() # compile them into a list, so that we can use sapply() to fit meta-analytic model for each meta-analytic case
+}
+
+# index the elements of the data list according to the order of meta-analysis cases. By doing this, we can find any meta-analytic case by retrieving its index
+names(dat_list) <- paste("MA", ma.id, sep = "_")
+
+# some datasets can not achieve convergence although we used different numerical optimizer, adjusted different step length. So we delete this dataset before model fitting
+dat_list <- dat_list[names(dat_list) != "MA_35" &
+                     names(dat_list) != "MA_67" &
+                     names(dat_list) != "MA_185" &
+                     names(dat_list) != "MA_313" &
+                     names(dat_list) != "MA_324" &
+                     names(dat_list) != "MA_358" &
+                     names(dat_list) != "MA_359" &
+                     names(dat_list) != "MA_406" &
+                     names(dat_list) != "MA_433"]
+
+
+# fit intercept-only model for each meta-analytic case
+model_all <- NA
+for (i in 1:length(dat_list)) {
+  model_all[i] <- rma.mv(yi = eff.size, V = var.eff.size, random = list(~1|study, ~1|obs), method = "REML", test = "t", data = dat_list[[i]], sparse = TRUE, control=list(optimizer="nlminb", rel.tol=1e-8, iter.max=1000)) %>% list()
+} # slightly less strict threshold (which by default is 1e-10); adjust the number of iterations (which by default is 150)
+
+
+# save to save time
+#saveRDS(model_all, file = "mod_fitted.Rds")
+model_all <- readRDS(file = "mod_fitted.Rds")
+
+#saveRDS(dat_list, file = "dat_list.Rds")
+dat_list <- readRDS(file = "dat_list.Rds")
+
+```
+
+# Calculation
+
+Calculate all heterogeneity metrics and their stratified version.
+
+```{r}
+# load pre-estimated quantities
+#h_stats <- readRDS(file = "h_stats.Rds")
+## extract heterogeneity estimates
+h_stats <- data.frame(MA_case = names(dat_list),
+                      I2_t = sapply(model_all, function(x) h.calc(x)[1,1]), 
+                      I2_b = sapply(model_all, function(x) h.calc(x)[2,1]),
+                      I2_w = sapply(model_all, function(x) h.calc(x)[3,1]),
+                      CV_t = sapply(model_all, function(x) h.calc(x)[1,2]),
+                      CV_b = sapply(model_all, function(x) h.calc(x)[2,2]),
+                      CV_w = sapply(model_all, function(x) h.calc(x)[3,2]),
+                      M_t = sapply(model_all, function(x) h.calc(x)[1,3]),
+                      M_b = sapply(model_all, function(x) h.calc(x)[2,3]),
+                      M_w = sapply(model_all, function(x) h.calc(x)[3,3]),
+                      beta0 = sapply(model_all, function(x) coef(x)),
+                      se = sapply(model_all, function(x) x$se),
+                      pvalue = sapply(model_all, function(x) x$pval),
+                      ci.lb = sapply(model_all, function(x) x$ci.lb),
+                      ci.ub = sapply(model_all, function(x) x$ci.ub),
+                      pi.lb = sapply(model_all, function(x) predict(x)$pi.lb),
+                      pi.ub = sapply(model_all, function(x) predict(x)$pi.ub))
+
+## extract variance
+sigma_stats <- data.frame(sigma2_t = sapply(model_all, function(x) sum(x$sigma2)),
+                          sigma2_b = sapply(model_all, function(x) x$sigma2[1]),
+                          sigma2_w = sapply(model_all, function(x) x$sigma2[2]),
+                          QEp = sapply(model_all, function(x) x$QEp))
+
+h_stats <- cbind(h_stats, sigma_stats)
+
+
+# using a different strategy to extract estimates
+#I2_t <- sapply(model_all, function(x) h.calc(x)[1,1])
+
+#I2_t <- NA
+#for (i in 1:length(model_all)) {
+# I2_t[i] <- h.calc(model_all[[i]])[1,1] %>% list()
+#}
+
+# how many CIs did not span 0
+which((h_stats$ci.lb*h_stats$ci.ub)>0) %>% length()
+
+# how many PIs did not span 0
+which((h_stats$pi.lb*h_stats$pi.ub)>0) %>% length()
+
+which((h_stats$ci.lb*h_stats$ci.ub)>0 & (h_stats$pi.lb*h_stats$pi.ub)<0) %>% length()
+
+# get sample size for each MA
+obs_N <- NA
+for (i in 1:length(dat_list)) {
+  obs_N[i] <- nrow(dat_list[[i]]) %>% list()
+}
+
+study_N <- NA
+for (i in 1:length(dat_list)) {
+  study_N[i] <- unique(dat_list[[i]]$study) %>% length() %>% list()
+}
+
+MA_year <- NA
+for (i in 1:length(dat_list)) {
+  MA_year[i] <- unique(dat_list[[i]]$meta.analysis.year) %>% list()
+}
+
+
+h_stats$obs_N <- unlist(obs_N)
+h_stats$study_N <- unlist(study_N)
+#h_stats$MA_year <- unlist(MA_year)
+
+
+# get effect size type for each MA
+h_stats$es.type <- sapply(dat_list, function(x) x$grouped_es[1])
+
+
+
+
+# add sampling error variance, the ratio of sampling error variance to overall mean, the ratio of sampling error variance to total variance
+h_stats <- h_stats %>% mutate(V_bar = sapply(model_all, function(x) sigma2_v(x))) %>% mutate(V_bar_to_beta0 = V_bar / abs(beta0), V_bar_to_sigma = V_bar / sigma2_t)
+
+#saveRDS(h_stats, file = "h_stats.Rds")
+h_stats <- readRDS(file = "h_stats.Rds")
+```
+
+
+# Robust data
+
+Load another independent dataset.
+
+```{r}
+#*************************************************************************#
+#           import datasets with calculated effect sizes                    
+#*************************************************************************#
+## read lnRR, SMD and Zr datasets, which contain the calculated effect size (es) and sampling variance (var)
+### lnRR
+lnRR_csv <- list.files(path = "data/robust_dat/lnRR", pattern = "*.csv", full.names = TRUE) %>% lapply(read_csv) %>% suppressMessages()  ## need to use full name of each dataset, otherwise read_csv is not able to read it
+### SMD
+SMD_csv <- list.files(path = "data/robust_dat/SMD", pattern = "*.csv", full.names = TRUE) %>% lapply(read_csv) %>% suppressMessages() 
+### Zr
+Zr_csv <- list.files(path = "data/robust_dat/Zr", pattern = "*.csv", full.names = TRUE) %>% lapply(read_csv) %>% suppressMessages() 
+
+### get names of each .csv file
+lnRR_filenames <- list.files(path = "data/robust_dat/lnRR", pattern = "*.csv", full.names = FALSE)
+SMD_filenames <- list.files(path = "data/robust_dat/SMD", pattern = "*.csv", full.names = FALSE)
+Zr_filenames <- list.files(path = "data/robust_dat/Zr", pattern = "*.csv", full.names = FALSE)
+### rename the elements of the list
+names(lnRR_csv) <- lnRR_filenames
+names(SMD_csv) <- SMD_filenames
+names(Zr_csv) <- Zr_filenames
+
+
+#*************************************************************************#
+#                      import datasets with raw data                    
+#*************************************************************************#
+
+## read another sets of lnRR, SMD and Zr datasets, which contain descriptive statistics (mean, sd and sample size)
+### lnRR
+lnRR_des_csv <- list.files(path = "data/robust_dat/lnRR/des_stat", pattern = "*.csv", full.names = TRUE) %>% lapply(read_csv) %>% suppressMessages() 
+lnRR_des_filenames <- list.files(path = "data/robust_dat/lnRR/des_stat", pattern = "*.csv", full.names = FALSE) # extract file names, which will be used later
+
+
+### SMD
+SMD_des_csv <- list.files(path = "data/robust_dat/SMD/des_stat", pattern = "*.csv", full.names = TRUE) %>% lapply(read_csv) %>% suppressMessages() 
+SMD_des_filenames <- list.files(path = "data/robust_dat/SMD/des_stat", pattern = "*.csv", full.names = FALSE) # extract file names, which will be used later
+
+
+## recalculate effect size for datasets with descriptive statistics
+### lnRR
+lnRR_es <- NA
+for (i in 1:length(lnRR_des_csv)) {
+  lnRR_es[i] <- escalc(measure = "ROM",
+                    m1i = T_mean,
+                    m2i = C_mean,
+                    sd1i = T_sd,
+                    sd2i = C_sd,
+                    n1i = T_n,
+                    n2i = C_n,
+                    data = lnRR_des_csv[[i]]) %>% list()
+}
+### rename the elements of the list
+names(lnRR_es) <- lnRR_des_filenames
+
+
+### SMD
+SMD_es <- NA
+for (i in 1:length(SMD_des_csv)) {
+  SMD_es[i] <- escalc(measure = "SMD",
+                    m1i = T_mean,
+                    m2i = C_mean,
+                    sd1i = T_sd,
+                    sd2i = C_sd,
+                    n1i = T_n,
+                    n2i = C_n,
+                    data = SMD_des_csv[[i]]) %>% list()
+}
+### rename the elements of the list
+names(SMD_es) <- SMD_des_filenames
+
+## to keep consistant, rename effect size and sampling variance
+### lnRR
+for (i in 1:length(lnRR_es)) {
+  names(lnRR_es[[i]])[names(lnRR_es[[i]]) == "yi"] <- "es"
+  names(lnRR_es[[i]])[names(lnRR_es[[i]]) == "vi"] <- "var"
+}
+### SMD
+for (i in 1:length(SMD_es)) {
+  names(SMD_es[[i]])[names(SMD_es[[i]]) == "yi"] <- "es"
+  names(SMD_es[[i]])[names(SMD_es[[i]]) == "vi"] <- "var"
+}
+
+## combine all datasets
+dat_list_rob <- c(lnRR_csv,lnRR_es,SMD_csv,SMD_es,Zr_csv)
+
+
+##  remove NAs, zero variance, and +-Inf
+### delete NAs, zero variance
+for (i in 1:length(dat_list_rob)) {
+  dat_list_rob[[i]] <- dat_list_rob[[i]][!is.na(dat_list_rob[[i]]$es) & !is.na(dat_list_rob[[i]]$var) & dat_list_rob[[i]]$var != 0, ]
+}
+### delete +-Inf
+for (i in 1:length(dat_list_rob)) {
+  dat_list_rob[[i]] <- dat_list_rob[[i]] %>% na.omit()
+}
+
+#saveRDS(dat_list_rob, file = "dat_list_rob.Rds")
+dat_list_rob <- readRDS(file = "dat_list_rob.Rds")
+
+
+
+#*************************************************************************#
+#                        meta-analytic overall mean                    
+#*************************************************************************#
+
+model_all_rob <- NA
+for (i in 1:length(dat_list_rob)) {
+  model_all_rob[i] <- rma.mv(yi = es, V = var, random = list(~1|study_ID, ~1|obs_ID), method = "REML", test = "t", data = dat_list_rob[[i]], sparse = TRUE, control=list(optimizer="nlminb", rel.tol=1e-8, iter.max=1000)) %>% list()
+} 
+
+# save to save time
+#saveRDS(model_all_rob, file = "mod_rob_fitted.Rds")
+model_all_rob <- readRDS(file = "mod_rob_fitted.Rds")
+
+```
+
+
+# Calculation
+
+Calculate all heterogeneity metrics and their stratified version.
+
+```{r}
+## extract heterogeneity estimates
+h_stats_rob <- data.frame(MA_case = names(dat_list_rob),
+                      I2_t = sapply(model_all_rob, function(x) h.calc(x)[1,1]), 
+                      I2_b = sapply(model_all_rob, function(x) h.calc(x)[2,1]),
+                      I2_w = sapply(model_all_rob, function(x) h.calc(x)[3,1]),
+                      CV_t = sapply(model_all_rob, function(x) h.calc(x)[1,2]),
+                      CV_b = sapply(model_all_rob, function(x) h.calc(x)[2,2]),
+                      CV_w = sapply(model_all_rob, function(x) h.calc(x)[3,2]),
+                      M_t = sapply(model_all_rob, function(x) h.calc(x)[1,3]),
+                      M_b = sapply(model_all_rob, function(x) h.calc(x)[2,3]),
+                      M_w = sapply(model_all_rob, function(x) h.calc(x)[3,3]),
+                      beta0 = sapply(model_all_rob, function(x) coef(x)),
+                      se = sapply(model_all_rob, function(x) x$se),
+                      pvalue = sapply(model_all_rob, function(x) x$pval),
+                      ci.lb = sapply(model_all_rob, function(x) x$ci.lb),
+                      ci.ub = sapply(model_all_rob, function(x) x$ci.ub),
+                      pi.lb = sapply(model_all_rob, function(x) predict(x)$pi.lb),
+                      pi.ub = sapply(model_all_rob, function(x) predict(x)$pi.ub))
+
+
+## extract variance
+sigma_stats_rob <- data.frame(sigma2_t = sapply(model_all_rob, function(x) sum(x$sigma2)),
+                          sigma2_b = sapply(model_all_rob, function(x) x$sigma2[1]),
+                          sigma2_w = sapply(model_all_rob, function(x) x$sigma2[2]),
+                          QEp = sapply(model_all_rob, function(x) x$QEp))
+
+h_stats_rob <- cbind(h_stats_rob, sigma_stats_rob)
+
+
+# get sample size for each MA
+obs_N <- NA
+for (i in 1:length(dat_list_rob)) {
+  obs_N[i] <- nrow(dat_list_rob[[i]]) %>% list()
+}
+
+study_N <- NA
+for (i in 1:length(dat_list_rob)) {
+  study_N[i] <- unique(dat_list_rob[[i]]$study_ID) %>% length() %>% list()
+}
+
+
+h_stats_rob$obs_N <- unlist(obs_N)
+h_stats_rob$study_N <- unlist(study_N)
+
+# get effect size type for each MA
+h_stats_rob$es.type <- c(rep("lnRR", length(lnRR_csv)), rep("lnRR", length(lnRR_es)), rep("SMD", length(SMD_csv)), rep("SMD", length(SMD_es)), rep("Zr", length(Zr_csv)))
+
+
+
+# function to estimate typical sampling error variance
+sigma2_v <- function(mod){
+  sigma2_v <- sum(1 / mod$vi) * (mod$k - 1) /
+    (sum(1 / mod$vi)^2 - sum((1 / mod$vi)^2))
+  return(sigma2_v)
+}
+
+# add sampling error variance, the ratio of sampling error variance to overall mean, the ratio of sampling error variance to total variance
+h_stats_rob <- h_stats_rob %>% mutate(V_bar = sapply(model_all_rob, function(x) sigma2_v(x))) %>% mutate(V_bar_to_beta0 = V_bar / abs(beta0), V_bar_to_sigma = V_bar / sigma2_t)
+
+#saveRDS(h_stats_rob, file = "h_stats_rob.Rds")
+h_stats_rob <- readRDS(file = "h_stats_rob.Rds")
+```
+
+
+# Combined data
+
+Combine the two datasets to increase representativeness.
+
+```{r}
+h_stats_all <- rbind(h_stats,h_stats_rob)
+```
+
+
+# Summary of distribution
+
+Summarize distributions for all heterogeneity metrics.
+
+```{r}
+# correlation between sigma and measures
+## mu
+with(filter(h_stats_all,es.type == "SMD"), cor.test(sigma2_t, abs(beta0), method = "spearman")) # confidence interval - with(filter(h_stats_all,es.type == "SMD"), ci.spear(alpha = 0.05, sigma2_t, abs(beta0))) https://search.r-project.org/CRAN/refmans/statpsych/html/ci.spear.html
+
+
+
+# summarize total sigma according to effect size measures
+#h_stats %>% group_by(es.type) %>%  summarise_at(vars(sigma_t), list(mean = mean)) # https://www.statology.org/r-mean-by-group/
+
+h_stats_all %>% group_by(es.type) %>%
+  summarize(Q1 = quantile(sigma2_t, probs = 0.25),
+            medium = quantile(sigma2_t, probs = 0.50),
+            Q3 = quantile(sigma2_t, probs = 0.75),
+            mean = mean(sigma2_t)) %>% dfround(2)
+
+# summarize between-sigma
+h_stats_all %>% group_by(es.type) %>%
+  summarize(Q1 = quantile(sigma2_b, probs = 0.25),
+            medium = quantile(sigma2_b, probs = 0.50),
+            Q3 = quantile(sigma2_b, probs = 0.75),
+            mean = mean(sigma2_b)) %>% dfround(2)
+
+# summarize within-sigma
+h_stats_all %>% group_by(es.type) %>%
+  summarize(Q1 = quantile(sigma2_w, probs = 0.25),
+            medium = quantile(sigma2_w, probs = 0.50),
+            Q3 = quantile(sigma2_w, probs = 0.75),
+            mean = mean(sigma2_w)) %>% dfround(2)
+
+
+
+# summarize V bar
+h_stats_all %>% group_by(es.type) %>%
+  summarize(Q1 = quantile(V_bar, probs = 0.25),
+            medium = quantile(V_bar, probs = 0.50),
+            Q3 = quantile(V_bar, probs = 0.75),
+            mean = mean(V_bar)) %>% dfround(3)
+
+
+h_stats_all %>% group_by(es.type) %>%
+  summarize(V_bar = mean(V_bar),
+            sigma_t = mean(sigma2_t)) %>% dfround(3)
+
+
+# summarize I2
+h_stats_all$I2_t %>% summary() %>% round(0)
+h_stats_all$I2_b %>% summary()
+h_stats_all$I2_w %>% summary()
+
+h_stats_all %>% group_by(es.type) %>%
+  summarize(Q1 = quantile(I2_t, probs = 0.25),
+            medium = quantile(I2_t, probs = 0.50),
+            Q3 = quantile(I2_t, probs = 0.75),
+            mean = mean(I2_t)) %>% dfround(0)
+
+
+# number of MA with I2_b < I2_w
+nrow(filter(h_stats_all, I2_b < I2_w)) # 242
+nrow(filter(h_stats_all, I2_b < I2_w)) / nrow(h_stats_all) # 47%
+filter(h_stats_all, I2_b < I2_w)$I2_t %>% summary()
+filter(h_stats_all, I2_b < I2_w)$I2_b %>% summary()
+filter(h_stats_all, I2_b < I2_w)$I2_w %>% summary()
+
+
+exp(boot::logit(0.2918360))
+
+# summarize CV
+h_stats_all$CV_t %>% summary()
+h_stats_all$CV_b %>% summary()
+h_stats_all$CV_w %>% summary()
+
+filter(h_stats, CV_t > 10)
+
+h_stats_all %>% group_by(es.type) %>%
+  summarize(Q1 = quantile(CV_t, probs = 0.25),
+            medium = quantile(CV_t, probs = 0.50),
+            Q3 = quantile(CV_t, probs = 0.75),
+            mean = mean(CV_t)) %>% dfround(1)
+
+
+# summarize M
+h_stats_all$M_t %>% summary()
+h_stats_all$M_b %>% summary()
+h_stats_all$M_w %>% summary()
+
+
+h_stats_all %>% group_by(es.type) %>%
+  summarize(Q1 = quantile(M_t, probs = 0.25),
+            medium = quantile(M_t, probs = 0.50),
+            Q3 = quantile(M_t, probs = 0.75),
+            mean = mean(M_t)) %>% dfround(1)
+
+```
+
+# Scenario analysis
+
+Some interesting scenario analyses, showing the inconsistency between different metrics. 
+
+```{r}
+# scenario1 - medium to large I2 but small CV
+scenario1 <- h_stats %>% filter(I2_t > 50 & CV_t < 1)
+#  scenario2 - medium to large I2 but small V bar
+scenario2 <- h_stats %>% filter(I2_t > 50 & v_bar_to_beta0 < 1)
+scenario3 <- scenario2 %>% filter(I2_t > 50 & CV_t < 1)
+```
+
+
+
+# Figure 2 - Simulated plot
+
+Figure 2 shown in the main text.
+
+```{r}
+# simulation informed by empirical distribution
+# panel A
+tau2 <- c(0.54,1.25,3.03) # Q1 to Q3 values extracted from empirical distribution of SMD's total sigma
+V_bar <- seq(2.79e-6,18.9,by=0.01) # min to max extracted from empirical distribution of SMD's typical sampling variance
+
+sim.dat <- crossing(V_bar,tau2)
+sim.dat <- sim.dat %>% mutate(I2 = tau2/(tau2 + V_bar))
+sim.dat <- sim.dat %>% mutate(Magnitude = case_when(tau2 == 0.54 ~ "Low",
+                                                    tau2 == 1.25 ~ "Medium",
+                                                    tau2 == 3.03 ~ "High"))
+
+sim.p1 <- ggplot(sim.dat, aes(x = V_bar, y = I2)) +
+  geom_line(aes(linetype = Magnitude)) + 
+  geom_ribbon(aes(ymin=0.75, ymax=Inf), linetype=1, alpha=0.4, fill = "#56B4E9", color = "red") + 
+  geom_ribbon(aes(ymin=0.5, ymax=0.75), linetype=1, alpha=0.4, fill = "#009E73", color = "red") + 
+  geom_ribbon(aes(ymin=0.25, ymax=0.5), linetype=1, alpha=0.4, fill = "#CC79A7", color = "red") +
+  geom_ribbon(aes(ymin=-Inf, ymax=0.25), linetype=1, alpha=0.4, fill = "#E6AB02", color = "red") + 
+  labs(x = expression("Typical sampling error variance"~bar(nu)), y = expression(paste(italic(I)^2))) +
+theme_bw() +
+  guides(linetype = "none") + 
+  theme(axis.text = element_text(color = "black"),
+        legend.background = element_blank()) + 
+  scale_y_continuous(labels = scales::percent_format())  + 
+  
+  geom_segment(aes(x = 5, y = 0.385, xend = 5, yend = 0.625),
+                  arrow = arrow(length = unit(0.3, "cm"), ends="first", type = "closed"), color = "grey30", linewidth = 0.3) + # https://stackoverflow.com/questions/38008863/how-to-draw-a-nice-arrow-in-ggplot2
+  geom_segment(aes(x = 5 + 5, y = 0.385 - 0.27, xend = 5 + 5, yend = 0.625),
+                  arrow = arrow(length = unit(0.3, "cm"), ends="first", type = "closed"), color = "grey30", linewidth = 0.3) + 
+  geom_segment(aes(x = 5 + 5 + 5, y = 0.385 - 0.27 - 0.08, xend = 5 + 5 + 5, yend = 0.625),
+                  arrow = arrow(length = unit(0.3, "cm"), ends="first", type = "closed"), color = "grey30", linewidth = 0.3)  + 
+
+annotate("text", x = 5, y = 0.66, label = expression(paste("High"~italic(sigma)[total]^2)), size = 2.5) +
+annotate("text", x = 5 + 5, y = 0.66, label = expression(paste("Medium"~italic(sigma)[total]^2)), size = 2.5) +
+annotate("text", x = 5 + 5 + 5, y = 0.66, label = expression(paste("Low"~italic(sigma)[total]^2)), size = 2.5) +
+  scale_x_continuous(expand = c(0, 0))
+
+
+
+# panel B
+V_bar <- c(0.0885,0.181,0.323) # Q1 to Q3 values extracted from empirical distribution of SMD's total sigma
+tau2 <- seq(6.90e-11,93.9,by=0.01) # min to max extracted from empirical distribution of SMD's typical sampling variance
+
+sim.dat <- crossing(V_bar,tau2)
+sim.dat <- sim.dat %>% mutate(I2 = tau2/(tau2 + V_bar))
+sim.dat <- sim.dat %>% mutate(Magnitude = case_when(V_bar == 0.0885 ~ "Low",
+                                                    V_bar == 0.181 ~ "Medium",
+                                                    V_bar == 0.323 ~ "High"))
+
+
+sim.p2 <- ggplot(sim.dat, aes(x = tau2, y = I2)) + geom_line(aes(linetype = Magnitude)) + 
+  geom_ribbon(aes(ymin=0.75, ymax=Inf), linetype=1, alpha=0.4, fill = "#56B4E9", color = "red") + 
+  geom_ribbon(aes(ymin=0.5, ymax=0.75), linetype=1, alpha=0.4, fill = "#009E73", color = "red") + 
+  geom_ribbon(aes(ymin=0.25, ymax=0.5), linetype=1, alpha=0.4, fill = "#CC79A7", color = "red") +
+  geom_ribbon(aes(ymin=-Inf, ymax=0.25), linetype=1, alpha=0.4, fill = "#E6AB02", color = "red") + 
+  labs(x = expression(paste("Total variance in effect size"~italic(sigma)[total]^2)), y = expression(paste(italic(I)^2))) +
+theme_bw() +
+  guides(linetype = "none") + 
+  theme(axis.text = element_text(color = "black"),
+        legend.background = element_blank()) + 
+  scale_y_continuous(labels = scales::percent_format()) +
+
+  geom_segment(aes(x = 5, y = 0.5, xend = 5, yend = 0.935),
+                  arrow = arrow(length = unit(0.3, "cm"), ends="last", type = "closed"), color = "grey30", linewidth = 0.3) + 
+  
+  geom_segment(aes(x = 5 + 5, y = 0.5, xend = 5 + 5, yend = 0.935 + 0.05),
+                  arrow = arrow(length = unit(0.3, "cm"), ends="last", type = "closed"), color = "grey30", linewidth = 0.3) + 
+  geom_segment(aes(x = 5 + 5 + 5, y = 0.5, xend = 5 + 5 + 5, yend = 0.935 + 0.05 + 0.01),
+                  arrow = arrow(length = unit(0.3, "cm"), ends="last", type = "closed"), color = "grey30",linewidth = 0.3)  + 
+
+annotate("text", x = 5, y = 0.465, label = expression(paste("High"~bar(nu))), size = 2.5) +
+annotate("text", x = 5 + 5, y = 0.465, label = expression(paste("Medium"~bar(nu))), size = 2.5) +
+annotate("text", x = 5 + 5 + 5, y = 0.465, label = expression(paste("Low"~bar(nu))), size = 2.5) +
+  scale_x_continuous(limits = c(0,18.9), expand = c(0, 0))
+
+
+png(filename = "figure/Figure 2.png", width = 7, height = 3, units = "in", type = "windows", res = 400)
+sim.p1 + sim.p2 + plot_layout(ncol =2, nrow = 1) + plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(face = "bold"))
+dev.off()
+
+```
+
+
+# Figure 3 - Distribution
+
+Figure 3 shown in the main text.
+
+```{r}
+# total
+distribution.I2 <- ggdensity(h_stats_all, x = "I2_t",
+   #add = "median", 
+   rug = TRUE,
+   color = "#56B4E9", 
+   fill = "#56B4E9"
+   #palette = c("#00AFBB", "#E7B800", "red", "blue", "green")
+   ) + 
+  geom_vline(xintercept = quantile(h_stats_all$I2_t, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(h_stats_all$I2_t, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(h_stats_all$I2_t, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(I)[total]^2)), y = "Density", fill = "Effect size measures") +
+  #guides(color="none")
+  #theme_classic2() +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0))
+
+
+# between-study
+distribution.I22 <- ggdensity(h_stats_all, x = "I2_b",
+   rug = TRUE,
+   color = "#009E73", 
+   fill = "#009E73"
+   ) + 
+  geom_vline(xintercept = quantile(h_stats_all$I2_b, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(h_stats_all$I2_b, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(h_stats_all$I2_b, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(I)[between]^2)), y = "Density", fill = "Effect size measures") +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) +
+  scale_x_continuous(expand = c(0, 0))
+ 
+
+
+# within-study
+distribution.I23 <- ggdensity(h_stats_all, x = "I2_w",
+   rug = TRUE,
+   color = "#CC79A7", 
+   fill = "#CC79A7"
+   ) + 
+  geom_vline(xintercept = quantile(h_stats_all$I2_w, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(h_stats_all$I2_w, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(h_stats_all$I2_w, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(I)[within]^2)), y = "Density", fill = "Effect size measures") +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0))
+
+
+
+
+# CVB
+# total
+distribution.CVB <- ggdensity(h_stats, x = "CV_t",
+   rug = TRUE,
+   color = "#56B4E9", fill = "#56B4E9"
+   ) + 
+  geom_vline(xintercept = quantile(h_stats_all$CV_t, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(h_stats_all$CV_t, probs = 0.5), linetype = "dashed", color="black") +
+  geom_vline(xintercept = quantile(h_stats_all$CV_t, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(CV)[total])), y = "Density", fill = "Effect size measures") + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(limits = c(0,5), expand = c(0, 0))
+
+
+# between-study
+distribution.CVB2 <- ggdensity(h_stats_all, x = "CV_b",
+   rug = TRUE,
+   color = "#009E73", fill = "#009E73"
+   ) + 
+  geom_vline(xintercept = quantile(h_stats_all$CV_b, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(h_stats_all$CV_b, probs = 0.5), linetype = "dashed", color="black") +
+  geom_vline(xintercept = quantile(h_stats_all$CV_b, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(CV)[between])), y = "Density", fill = "Effect size measures") + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) +
+  scale_x_continuous(limits = c(0,5), expand = c(0, 0))
+
+# within-study
+distribution.CVB3 <- ggdensity(h_stats_all, x = "CV_w",
+   rug = TRUE,
+   color = "#CC79A7", fill = "#CC79A7"
+   ) + 
+  geom_vline(xintercept = quantile(h_stats_all$CV_w, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(h_stats_all$CV_w, probs = 0.5), linetype = "dashed", color="black") +
+  geom_vline(xintercept = quantile(h_stats_all$CV_w, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(CV)[within])), y = "Density", fill = "Effect size measures") + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(limits = c(0,5), expand = c(0, 0))
+
+
+
+
+# M1
+# total
+distribution.M1 <- ggdensity(h_stats_all, x = "M_t",
+   rug = TRUE,
+   color = "#56B4E9", fill = "#56B4E9"
+   ) + 
+    geom_vline(xintercept = quantile(h_stats_all$M_t, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(h_stats_all$M_t, probs = 0.5), linetype = "dashed", color="black") +
+  geom_vline(xintercept = quantile(h_stats_all$M_t, probs = 0.75), linetype = "dashed", color="blue") +
+    labs(x = expression(paste(italic(M)[total])), y = "Density", fill = "Effect size measures") +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0))
+
+
+# between-study
+distribution.M12 <- ggdensity(h_stats_all, x = "M_b",
+   rug = TRUE,
+   color = "#009E73", fill = "#009E73"
+   ) + 
+    geom_vline(xintercept = quantile(h_stats_all$M_b, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(h_stats_all$M_b, probs = 0.5), linetype = "dashed", color="black") +
+  geom_vline(xintercept = quantile(h_stats_all$M_b, probs = 0.75), linetype = "dashed", color="blue") +
+    labs(x = expression(paste(italic(M)[between])), y = "Density", fill = "Effect size measures") +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0))
+
+
+# within-study
+distribution.M13 <- ggdensity(h_stats_all, x = "M_w",
+   rug = TRUE,
+   color = "#CC79A7", fill = "#CC79A7"
+   ) + 
+    geom_vline(xintercept = quantile(h_stats_all$M_w, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(h_stats_all$M_w, probs = 0.5), linetype = "dashed", color="black") +
+  geom_vline(xintercept = quantile(h_stats_all$M_w, probs = 0.75), linetype = "dashed", color="blue") +
+    labs(x = expression(paste(italic(M)[within])), y = "Density", fill = "Effect size measures") +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0))
+
+
+
+png(filename = "figure/Figure 3.png", width = 12, height = 12, units = "in", type = "windows", res = 400)
+  distribution.I2 + distribution.CVB + distribution.M1 + 
+  distribution.I22 + distribution.CVB2 + distribution.M12 +
+  distribution.I23 + distribution.CVB3 + distribution.M13 +
+  plot_layout(ncol = 3, nrow = 3) + plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(size = 20, face = "bold"))
+dev.off()
+```
+
+# Figure 4 - Comparison
+
+Figure 4 shown in the main text.
+
+```{r}
+# https://github.com/jorvlan/raincloudplots
+#I2
+df_1x1 <- data_1x1(
+  array_1 = h_stats_all$I2_b,
+  array_2 = h_stats_all$I2_w,
+  jit_distance = .2, # 0.09
+  jit_seed = 321)
+
+
+paired_I2 <- raincloud_1x1_repmes(
+  data = df_1x1, # BottleRocket2
+  colors = c("#009E73","#CC79A7"), # brewer.pal(n = 8, name = "Dark2")[1:2], #wes_palette("Rushmore1", 4, type = "discrete")[c(4,3,4,3)],
+  fills = c("#009E73","#CC79A7"), # wes_palette("Rushmore1", 4, type = "discrete")[c(4,3,4,3)], # https://www.datanovia.com/en/blog/top-r-color-palettes-to-know-for-great-data-visualization/
+  line_color = 'gray',
+  line_alpha = .3,
+  size = 1,
+  alpha = .5,
+  align_clouds = FALSE) +
+
+scale_x_continuous(breaks=c(1,2), 
+                   labels=c("Between-study", "Within-study"), 
+                   #limits=c(0, 100)
+                   ) +
+  xlab(" ") +
+  ylab(expression(paste(italic(I)^2))) + 
+  #annotate(geom = "text", x= 1, y = -1, label = "Publication bias") +
+  #annotate(geom = "text", x= 4, y = -1, label = "No publication bias") +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 8, color = "black"), 
+        axis.title = element_text(size = 10, color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) 
+
+
+
+#CV
+df_1x1 <- data_1x1(
+  array_1 = filter(h_stats_all, CV_t <= 5)$CV_b, 
+  array_2 = filter(h_stats_all, CV_t <= 5)$CV_w,
+  jit_distance = .2,
+  jit_seed = 321) 
+
+
+paired_CV <- raincloud_1x1_repmes(
+  data = df_1x1, 
+  colors = c("#009E73","#CC79A7"),
+  fills = c("#009E73","#CC79A7"),
+  line_color = 'gray',
+  line_alpha = .3,
+  size = 1,
+  alpha = .5,
+  align_clouds = FALSE) +
+
+scale_x_continuous(breaks=c(1,2), 
+                   labels=c("Between-study", "Within-study")
+                   ) +
+  xlab(" ") +
+  ylab(expression(paste(italic(CV)))) + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 8, color = "black"), 
+        axis.title = element_text(size = 10, color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) 
+
+
+#M
+df_1x1 <- data_1x1(
+  array_1 = h_stats_all$M_b,
+  array_2 = h_stats_all$M_w,
+  jit_distance = .2,
+  jit_seed = 321) 
+
+
+
+paired_M <- raincloud_1x1_repmes(
+  data = df_1x1, 
+  colors = c("#009E73","#CC79A7"),
+  fills = c("#009E73","#CC79A7"),
+  line_color = 'gray',
+  line_alpha = .3,
+  size = 1,
+  alpha = 0.5,
+  align_clouds = F) +
+
+scale_x_continuous(breaks=c(1,2), 
+                   labels=c("Between-study", "Within-study")
+                   ) +
+  xlab("Stratified heterogeneity") +
+  ylab(expression(paste(italic(M)))) + 
+  theme_bw() +
+  theme(axis.text = element_text(size = 8, color = "black"), 
+        axis.title = element_text(size = 10, color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) 
+
+
+png(filename = "figure/Figure 4.png", width = 5, height = 8, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(paired_I2, paired_CV, paired_M, labels = c('A', 'B', 'C'), label_size = 12,nrow = 3, ncol = 1)
+dev.off()
+
+
+```
+
+
+# Figure 5 - Disagreement
+
+Figure 5 shown in the main text.
+
+```{r}
+# disagreement test
+with(h_stats_all, ci.spear(alpha = 0.05, I2_t, CV_t))  
+with(h_stats_all, ci.spear(alpha = 0.05, I2_t, M_t))
+with(h_stats_all, ci.spear(alpha = 0.05, M_t, CV_t))
+
+# I2_vs_CVB 
+## total
+I2_vs_CVB <- h_stats_all %>%
+  ggplot() +
+  #geom_point(aes(x = I2_t, y = CV_t, size = obs_N), alpha = 0.4, color = "#56B4E9", fill = "#56B4E9") +
+  geom_point(aes(x = I2_t, y = CV_t, size = obs_N), alpha = 0.6, color = wes_palette("BottleRocket2", 4, type = "discrete")[3], fill = wes_palette("BottleRocket2", 4, type = "discrete")[3]) + 
+  #geom_smooth(aes(x = I2s_Shinichi, y = CVBs), method =  "lm", formula = y~x, se = FALSE) +
+  labs(x = expression(paste(italic(I)[total]^2)), y = expression(paste(italic(CV)[total])), size = "Sample size") +
+  #guides(color = "none") +
+  #scale_x_continuous(limits = c(-0.5,100), expand = c(0,0)) +
+  #scale_y_continuous(limits = c(-1,90),expand = c(0,0)) +
+  theme_bw() +
+  #theme_classic2() + 
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        #legend.background = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 14, color = "black"),
+        axis.title = element_text(size = 16, color = "black")
+        ) +
+  scale_y_continuous(limits = c(0,5))
+
+
+# between-study
+I2_vs_CVB2 <- h_stats_all %>%
+  ggplot() +
+  geom_point(aes(x = I2_b, y = CV_b, size = obs_N), alpha = 0.4, color = "#56B4E9", fill = "#56B4E9") +
+  #geom_smooth(aes(x = I2s_Shinichi, y = CVBs), method =  "lm", formula = y~x, se = FALSE) +
+  labs(x = expression(paste(italic(I)[between]^2)), y = expression(paste(italic(CV)[between])), size = "Sample size") + 
+  #guides(color = "none") +
+  #scale_x_continuous(limits = c(-0.5,100), expand = c(0,0)) +
+  #scale_y_continuous(limits = c(-1,90),expand = c(0,0)) +
+  theme_bw() + 
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        #legend.background = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 12, color = "black"))
+
+# within-study
+I2_vs_CVB3 <- h_stats_all %>%
+  ggplot() +
+  geom_point(aes(x = I2_w, y = CV_w, size = obs_N), alpha = 0.4, color = "#56B4E9", fill = "#56B4E9") +
+  #geom_smooth(aes(x = I2s_Shinichi, y = CVBs), method =  "lm", formula = y~x, se = FALSE) +
+  labs(x = expression(paste(italic(I)[within]^2)), y = expression(paste(italic(CV)[within])), size = "Sample size") +
+  #guides(color = "none") +
+  #scale_x_continuous(limits = c(-0.5,100), expand = c(0,0)) +
+  #scale_y_continuous(limits = c(-1,90),expand = c(0,0)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        #legend.background = element_rect(colour = "transparent", fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 14, colour = "black"),
+        axis.title = element_text(size = 14, color = "black"))
+
+# CVB_vs_M1 
+## total
+CVB_vs_M1 <- h_stats_all %>% 
+  ggplot() +
+  geom_point(aes(x = CV_t, y = M_t, size = obs_N), alpha = 0.6, color = wes_palette("BottleRocket2", 4, type = "discrete")[2], fill = wes_palette("BottleRocket2", 4, type = "discrete")[2]) +
+  labs(x = expression(CV[total]), y = expression(M[total]), colour = "Effect size measures", size = "Sample size") +
+  labs(x = expression(paste(italic(CV)[total])), y = expression(paste(italic(M)[total])), size = "Sample size") +
+  #scale_x_continuous(limits = c(-1,90), expand = c(0,0)) +
+  #scale_y_continuous(limits = c(-0.05,1),expand = c(0,0)) +
+  theme_bw() +
+  theme(legend.position= c(1, 1), 
+        legend.justification = c(1, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 14, color = "black"),
+        axis.title = element_text(size = 16, color = "black")
+        )
+
+
+## between-study
+CVB_vs_M12 <- h_stats_all %>% 
+  ggplot() +
+  geom_point(aes(x = CV_b, y = M_b, size = obs_N), alpha = 0.4, color = "#009E73", fill = "#009E73") +
+  labs(x = expression(CV[b]), y = expression(M[b]), colour = "Effect size measures", size = "Sample size") +
+  labs(x = expression(paste(italic(CV)[between])), y = expression(paste(italic(M)[between])), size = "Sample size") +
+  #scale_x_continuous(limits = c(-1,90), expand = c(0,0)) +
+  #scale_y_continuous(limits = c(-0.05,1),expand = c(0,0)) +
+  theme_bw() +
+  theme(legend.position= c(1, 1), 
+        legend.justification = c(1, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 14, color = "black"),
+        axis.title = element_text(size = 14, color = "black")
+        ) 
+
+## within-study
+CVB_vs_M13 <- h_stats_all %>% 
+  ggplot() +
+  geom_point(aes(x = CV_w, y = M_w, size = obs_N), alpha = 0.4, color = "#009E73", fill = "#009E73") +
+  labs(x = expression(CV[w]), y = expression(M[w]), colour = "Effect size measures", size = "Sample size") +
+  labs(x = expression(paste(italic(CV)[within])), y = expression(paste(italic(M)[within])), size = "Sample size") +
+  #scale_x_continuous(limits = c(-1,90), expand = c(0,0)) +
+  #scale_y_continuous(limits = c(-0.05,1),expand = c(0,0)) +
+  theme_bw() +
+  theme(legend.position= c(1, 1), 
+        legend.justification = c(1, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 14, color = "black"),
+        axis.title = element_text(size = 14, color = "black")
+        )
+
+
+# I2_vs_M1 
+## total
+I2_vs_M1 <- h_stats_all %>% 
+  ggplot() +
+  geom_point(aes(x = I2_t, y = M_t, size = obs_N), alpha = 0.6, color = wes_palette("BottleRocket2", 4, type = "discrete")[4], fill = wes_palette("BottleRocket2", 4, type = "discrete")[4]) +
+  labs(x = expression(paste(italic(I)[total]^2)), y = expression(paste(italic(M)[total])), size = "Sample size") +
+  #scale_x_continuous(limits = c(-0.5,100), expand = c(0,0)) +
+  #scale_y_continuous(limits = c(-0.005,1),expand = c(0,0)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 14, color = "black"),
+        axis.title = element_text(size = 16, colour = "black")
+        ) 
+
+## between-study
+I2_vs_M12 <- h_stats_all %>% 
+  ggplot() +
+  geom_point(aes(x = I2_b, y = M_b, size = obs_N), alpha = 0.4, color = "#CC79A7", fill = "#CC79A7") +
+  labs(x = expression(paste(italic(I)[between]^2)), y = expression(paste(italic(M)[between])), size = "Sample size") +
+  #scale_x_continuous(limits = c(-0.5,100), expand = c(0,0)) +
+  #scale_y_continuous(limits = c(-0.005,1),expand = c(0,0)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 14, color = "black"),
+        axis.title = element_text(size = 14, color = "black")
+        )
+
+## within-study
+I2_vs_M13 <- h_stats_all %>% 
+  ggplot() +
+  geom_point(aes(x = I2_w, y = M_w, size = obs_N), alpha = 0.4, color = "#CC79A7", fill = "#CC79A7") +
+  labs(x = expression(paste(italic(I)[within]^2)), y = expression(paste(italic(M)[within])), size = "Sample size") +
+  #scale_x_continuous(limits = c(-0.5,100), expand = c(0,0)) +
+  #scale_y_continuous(limits = c(-0.005,1),expand = c(0,0)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 14, color = "black"),
+        axis.title = element_text(size = 14, color = "black")
+        )
+
+# layout
+png(filename = "figure/Figure 5.png", width = 13, height = 4.5, units = "in", type = "windows", res = 400)
+  I2_vs_CVB + I2_vs_M1 + CVB_vs_M1 + 
+  #I2_vs_CVB2 + I2_vs_M12 + CVB_vs_M12 +
+  #I2_vs_CVB3 + I2_vs_M13 + CVB_vs_M13 + 
+  plot_layout(ncol = 3, nrow = 1) + plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(size = 20, face = "bold"))
+dev.off()
+# https://patchwork.data-imaginist.com/articles/patchwork.html#:~:text=Patchwork%20is%20a%20package%20designed%20to%20make%20plot,we%E2%80%99ll%20work%20through%20the%20basics%20of%20using%20patchwork.
+
+
+
+```
+
+
+# Supplementary Figures
+
+Figures shown in supplementary materials.
+
+## Distribution of sigma^2
+
+```{r}
+# SMD
+dat_sigma <- filter(h_stats_all, es.type == "SMD")
+distribution.sigma2.SMD <- ggdensity(dat_sigma, x = "sigma2_t", y = "..density..", #facet.by = "es.type",
+   #add = "median", 
+   rug = TRUE, alpha = 0.3,
+   color = brewer.pal(n = 12, name = "Set3")[1], # brewer.pal(n = 8, name = "Dark2")[1]
+   fill = brewer.pal(n = 12, name = "Set3")[1]
+   ) + 
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(sigma)[total]^2)~"[SMD]"), y = "Density", fill = "Effect size measures") +
+  #guides(color="none")
+  #theme_classic2() +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = c(0,18.9))
+  
+
+
+# lnRR
+dat_sigma <- filter(h_stats_all, es.type == "lnRR")
+distribution.sigma2.lnRR <- ggdensity(dat_sigma, x = "sigma2_t", y = "..density..",
+   #add = "median", 
+   rug = TRUE, alpha = 0.3,
+   color = brewer.pal(n = 12, name = "Set3")[3], 
+   fill = brewer.pal(n = 12, name = "Set3")[3]
+   ) + 
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(sigma)[total]^2)~"[lnRR]"), y = "Density", fill = "Effect size measures") +
+  #guides(color="none")
+  #theme_classic2() +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = c(0,10))
+
+
+# Zr
+dat_sigma <- filter(h_stats_all, es.type == "Zr")
+distribution.sigma2.Zr <- ggdensity(dat_sigma, x = "sigma2_t", y = "..density..",
+   #add = "median", 
+   rug = TRUE, alpha = 0.3,
+   color = brewer.pal(n = 12, name = "Set3")[4], 
+   fill = brewer.pal(n = 12, name = "Set3")[4]
+   ) + 
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(sigma)[total]^2)~"[Zr]"), y = "Density", fill = "Effect size measures") +
+  #guides(color="none")
+  #theme_classic2() +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = c(0,3))
+
+# binary
+dat_sigma <- filter(h_stats_all, es.type == "binary")
+distribution.sigma2.binary <- ggdensity(dat_sigma, x = "sigma2_t", y = "..density..",
+   #add = "median", 
+   rug = TRUE, alpha = 0.3,
+   color = brewer.pal(n = 12, name = "Set3")[5], 
+   fill = brewer.pal(n = 12, name = "Set3")[5]
+   ) + 
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(sigma)[total]^2)~"[2-by-2 table]"), y = "Density", fill = "Effect size measures") +
+  #guides(color="none")
+  #theme_classic2() +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = c(0,5))
+
+
+# uncommon
+dat_sigma <- filter(h_stats_all, es.type == "uncommon")
+distribution.sigma2.uncommon <- ggdensity(dat_sigma, x = "sigma2_t", y = "..density..",
+   #add = "median", 
+   rug = TRUE, alpha = 0.3,
+   color = brewer.pal(n = 12, name = "Set3")[6], 
+   fill = brewer.pal(n = 12, name = "Set3")[6]
+   ) + 
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(dat_sigma$sigma2_t, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(sigma)[total]^2)~"[Uncommon metric]"), y = "Density", fill = "Effect size measures") +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = c(0,max(dat_sigma$sigma2_t)))
+
+
+
+
+png(filename = "figure/Figure S1.png", width = 8, height = 10, units = "in", type = "windows", res = 400)
+  distribution.sigma2.SMD + distribution.sigma2.lnRR +
+    distribution.sigma2.Zr + distribution.sigma2.binary +
+    distribution.sigma2.uncommon + plot_layout(ncol = 2, nrow = 3) + plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(size = 20, face = "bold"))
+dev.off()
+```
+
+
+## Distribution of V bar
+
+```{r}
+# SMD
+dat_Vbar <- filter(h_stats_all, es.type == "SMD")
+distribution.Vbar.SMD <- ggdensity(dat_Vbar, x = "V_bar", y = "..density..", #facet.by = "es.type",
+   #add = "median", 
+   rug = TRUE, alpha = 0.3,
+   color = brewer.pal(n = 12, name = "Set3")[7], 
+   fill = brewer.pal(n = 12, name = "Set3")[7]
+   ) + 
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(bar(nu)[total])~"[SMD]"), y = "Density", fill = "Effect size measures") +
+  #guides(color="none")
+  #theme_classic2() +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = c(0,18.9))
+  
+
+
+# lnRR
+dat_Vbar <- filter(h_stats_all, es.type == "lnRR")
+distribution.Vbar.lnRR <- ggdensity(dat_Vbar, x = "V_bar", y = "..density..", #facet.by = "es.type",
+   #add = "median", 
+   rug = TRUE, alpha = 0.3,
+   color = brewer.pal(n = 12, name = "Set3")[8], 
+   fill = brewer.pal(n = 12, name = "Set3")[8]
+   ) + 
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(bar(nu)[total])~"[lnRR]"), y = "Density", fill = "Effect size measures") +
+  #guides(color="none")
+  #theme_classic2() +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = c(0,max(dat_Vbar$V_bar)))
+
+
+# Zr
+dat_Vbar <- filter(h_stats_all, es.type == "Zr")
+distribution.Vbar.Zr <- ggdensity(dat_Vbar, x = "V_bar", y = "..density..", #facet.by = "es.type",
+   #add = "median", 
+   rug = TRUE, alpha = 0.3,
+   color = brewer.pal(n = 12, name = "Set3")[9], 
+   fill = brewer.pal(n = 12, name = "Set3")[9]
+   ) + 
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(bar(nu)[total])~"[Zr]"), y = "Density", fill = "Effect size measures") +
+  #guides(color="none")
+  #theme_classic2() +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = c(0,max(dat_Vbar$V_bar)))
+
+# binary
+dat_Vbar <- filter(h_stats_all, es.type == "binary")
+distribution.Vbar.binary <- ggdensity(dat_Vbar, x = "V_bar", y = "..density..", #facet.by = "es.type",
+   #add = "median", 
+   rug = TRUE, alpha = 0.3,
+   color = brewer.pal(n = 12, name = "Set3")[10], 
+   fill = brewer.pal(n = 12, name = "Set3")[10]
+   ) + 
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(bar(nu)[total])~"[2-by-2 table]"), y = "Density", fill = "Effect size measures") +
+  #guides(color="none")
+  #theme_classic2() +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = c(0,max(dat_Vbar$V_bar)))
+
+
+# uncommon
+dat_Vbar <- filter(h_stats_all, es.type == "uncommon")
+distribution.Vbar.uncommon <- ggdensity(dat_Vbar, x = "V_bar", y = "..density..", #facet.by = "es.type",
+   #add = "median", 
+   rug = TRUE, alpha = 0.3,
+   color = brewer.pal(n = 12, name = "Set3")[11], 
+   fill = brewer.pal(n = 12, name = "Set3")[11]
+   ) + 
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.5), linetype = "dashed", color="black")+
+  geom_vline(xintercept = quantile(dat_Vbar$V_bar, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(bar(nu)[total])~"[Uncommon metric]"), y = "Density", fill = "Effect size measures") +
+  #guides(color="none")
+  #theme_classic2() +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0)) + coord_cartesian(xlim = c(0,max(dat_Vbar$V_bar)))
+
+
+
+
+png(filename = "figure/Figure S2.png", width = 8, height = 10, units = "in", type = "windows", res = 400)
+  distribution.Vbar.SMD + distribution.Vbar.lnRR +
+    distribution.Vbar.Zr + distribution.Vbar.binary +
+    distribution.Vbar.uncommon + plot_layout(ncol = 2, nrow = 3) + plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(size = 20, face = "bold"))
+dev.off()
+```
+
+## Untruncated distribution of CV
+
+```{r}
+# CVB
+# total
+distribution.CVB_un <- ggdensity(h_stats, x = "CV_t",
+   #add = "median", 
+   rug = TRUE,
+   color = "#56B4E9", fill = "#56B4E9"
+   ) + 
+  geom_vline(xintercept = quantile(h_stats_all$CV_t, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(h_stats_all$CV_t, probs = 0.5), linetype = "dashed", color="black") +
+  geom_vline(xintercept = quantile(h_stats_all$CV_t, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(CV)[total])), y = "Density", fill = "Effect size measures") + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0))
+
+
+# between-study
+distribution.CVB2_un <- ggdensity(h_stats_all, x = "CV_b",
+   #add = "median", 
+   rug = TRUE,
+   color = "#009E73", fill = "#009E73"
+   ) + 
+  geom_vline(xintercept = quantile(h_stats_all$CV_b, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(h_stats_all$CV_b, probs = 0.5), linetype = "dashed", color="black") +
+  geom_vline(xintercept = quantile(h_stats_all$CV_b, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(CV)[between])), y = "Density", fill = "Effect size measures") + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) +
+  scale_x_continuous(expand = c(0, 0))
+
+# within-study
+distribution.CVB3_un <- ggdensity(h_stats_all, x = "CV_w",
+   #add = "median", 
+   rug = TRUE,
+   color = "#CC79A7", fill = "#CC79A7"
+   ) + 
+  geom_vline(xintercept = quantile(h_stats_all$CV_w, probs = 0.25), linetype = "dashed", color="red") + 
+  geom_vline(xintercept = quantile(h_stats_all$CV_w, probs = 0.5), linetype = "dashed", color="black") +
+  geom_vline(xintercept = quantile(h_stats_all$CV_w, probs = 0.75), linetype = "dashed", color="blue") +
+  labs(x = expression(paste(italic(CV)[within])), y = "Density", fill = "Effect size measures") + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        axis.title.x = element_text(size = 16, color = "black")) + 
+  scale_x_continuous(expand = c(0, 0))
+
+
+
+
+
+png(filename = "figure/Figure S3.png", width = 12, height = 4, units = "in", type = "windows", res = 400)
+  distribution.CVB_un +  distribution.CVB2_un + distribution.CVB3_un +
+  plot_layout(ncol = 3, nrow = 1) + plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(size = 20, face = "bold"))
+dev.off()
+```
+
+## Untruncated comparison of CV
+
+```{r}
+
+#CV
+df_1x1 <- data_1x1(
+  array_1 = h_stats_all$CV_b, 
+  array_2 = h_stats_all$CV_w,
+  jit_distance = .09,
+  jit_seed = 321) 
+
+paired_CV_un <- raincloud_1x1_repmes(
+  data = df_1x1,
+  colors = c("#009E73","#CC79A7"),
+  fills = c("#009E73","#CC79A7"),
+  line_color = 'gray',
+  line_alpha = .3,
+  size = 1,
+  alpha = .5,
+  align_clouds = FALSE) +
+
+scale_x_continuous(breaks=c(1,2), 
+                   labels=c("Between-study", "Within-study"), 
+                   #limits=c(0, 100)
+                   ) +
+  xlab(" ") +
+  ylab(expression(paste(italic(CV)))) + 
+  theme_bw() + 
+  theme(axis.text = element_text(size = 8, color = "black"), 
+        axis.title = element_text(size = 10, color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) 
+
+
+png(filename = "figure/Figure S4.png", width = 5, height = 3, units = "in", type = "windows", res = 400)
+paired_CV_un
+dev.off()
+
+
+```
+
+## Kappa coefficient
+
+```{r}
+# correlation can be used because correlation is independent of data ranges; see https://stackoverflow.com/questions/12116195/correlate-two-data-sets-of-different-scales
+
+# https://www.datanovia.com/en/lessons/weighted-kappa-in-r-for-two-ordinal-variables/
+
+# calculate quantiles 
+## I2
+I2_summary <- data.frame(Q1 = quantile(h_stats_all$I2_t, probs = 0.25) %>% as.numeric(),
+           Q2 = quantile(h_stats_all$I2_t, probs = 0.50) %>% as.numeric(),
+           Q3 = quantile(h_stats_all$I2_t, probs = 0.75) %>% as.numeric()) %>% dfround(1)
+
+## CVB
+CVB_summary <- data.frame(Q1 = quantile(h_stats_all$CV_t, probs = 0.25) %>% as.numeric(),
+           Q2 = quantile(h_stats_all$CV_t, probs = 0.50) %>% as.numeric(),
+           Q3 = quantile(h_stats_all$CV_t, probs = 0.75) %>% as.numeric()) %>% dfround(1)
+
+
+## M1
+M1_summary <- data.frame(Q1 = quantile(h_stats_all$M_t, probs = 0.25) %>% as.numeric(),
+           Q2 = quantile(h_stats_all$M_t, probs = 0.50) %>% as.numeric(),
+           Q3 = quantile(h_stats_all$M_t, probs = 0.75) %>% as.numeric()) %>% dfround(1)
+
+
+# I2 interpretation
+I2_inter <- NA
+I2_inter[h_stats_all$I2_t <= I2_summary$Q1] <- c("Small") 
+I2_inter[h_stats_all$I2_t > I2_summary$Q1 & h_stats_all$I2_t < I2_summary$Q3] <- c("Medium") 
+I2_inter[h_stats_all$I2_t >= I2_summary$Q3] <- c("Large") 
+h_stats_inter <- h_stats_all
+h_stats_inter$I2_interpretation <- I2_inter
+# CVB interpretation
+CVB_inter <- NA
+CVB_inter[h_stats_all$CV_t <= CVB_summary$Q1] <- c("Small") 
+CVB_inter[h_stats_all$CV_t > CVB_summary$Q1 & h_stats_all$CV_t < CVB_summary$Q3] <- c("Medium") 
+CVB_inter[h_stats_all$CV_t >= CVB_summary$Q3] <- c("Large") 
+h_stats_inter$CV_interpretation <- CVB_inter
+
+# M1 interpretation
+M1_inter <- NA
+M1_inter[h_stats_all$M_t <= M1_summary$Q1] <- c("Small") 
+M1_inter[h_stats_all$M_t > M1_summary$Q1 & h_stats_all$M_t < M1_summary$Q3] <- c("Medium") 
+M1_inter[h_stats_all$M_t >= M1_summary$Q3] <- c("Large") 
+h_stats_inter$M_interpretation <- M1_inter
+
+# turn into desired orders
+h_stats_inter$I2_interpretation <- generics::as.factor(h_stats_inter$I2_interpretation) 
+h_stats_inter$I2_interpretation <- factor(h_stats_inter$I2_interpretation, levels = c("Small","Medium","Large"))
+
+h_stats_inter$CV_interpretation <- generics::as.factor(h_stats_inter$CV_interpretation) 
+h_stats_inter$CV_interpretation <- factor(h_stats_inter$CV_interpretation, levels = c("Small","Medium","Large"))
+h_stats_inter$M_interpretation <- generics::as.factor(h_stats_inter$M_interpretation) 
+h_stats_inter$M_interpretation <- factor(h_stats_inter$M_interpretation, levels = c("Small","Medium","Large"))
+
+
+# disagreement plot
+# save  - https://www.rdocumentation.org/packages/vcd/versions/1.4-10/topics/agreementplot
+# rename - https://stackoverflow.com/questions/66860927/resizing-agreementplot-from-vcd-library-in-r
+k.I2.CV <- structable(I2_interpretation ~ CV_interpretation, data=h_stats_inter) %>% as.table %>% agreementplot(return_grob = T, weights = 1, xlab = expression(paste(italic(I)[total]^2)), ylab = expression(paste(italic(CV)[total])))# with(h_stats2,ftable(I2_interpretation,CVB_interpretation)) %>% as.table %>% vcd::agreementplot(weights = 1)
+# alternatively, use cotabplot:
+#cotabplot(structable(I2_interpretation ~ CV_interpretation, data=h_stats_inter) %>% as.table, panel = cotab_agreementplot)
+
+k.I2.M <- structable(I2_interpretation ~ M_interpretation, data=h_stats_inter) %>% as.table %>% agreementplot(return_grob = T, weights = 1, xlab = expression(paste(italic(I)[total]^2)), ylab = expression(paste(italic(M)[total])))
+
+k.M.CV <- structable(M_interpretation ~ CV_interpretation, data=h_stats_inter) %>% as.table %>% agreementplot(return_grob = T, weights = 1, xlab = expression(paste(italic(M)[total])), ylab = expression(paste(italic(CV)[total])))
+
+
+png(filename = "figure/Figure S5.png", width = 5, height = 5, units = "in", type = "windows", res = 400)
+grid.draw(attributes(k.I2.CV)$grob)
+dev.off()
+
+png(filename = "figure/Figure S6.png", width = 5, height = 5, units = "in", type = "windows", res = 400)
+grid.draw(attributes(k.I2.M)$grob)
+dev.off()
+
+png(filename = "figure/Figure S7.png", width = 5, height = 5, units = "in", type = "windows", res = 400)
+grid.draw(attributes(k.M.CV)$grob)
+dev.off()
+
+# kappa coefficient
+structable(I2_interpretation ~ CV_interpretation, data=h_stats_inter) %>% as.table %>% vcd::Kappa() %>% print(CI=T)
+
+structable(I2_interpretation ~ M_interpretation, data=h_stats_inter) %>% as.table %>% vcd::Kappa() %>% print(CI=T)
+
+structable(M_interpretation ~ CV_interpretation, data=h_stats_inter) %>% as.table %>% vcd::Kappa() %>% print(CI=T)
+
+```
